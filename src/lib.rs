@@ -20,6 +20,7 @@
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -475,7 +476,7 @@ struct State {
     queue: ConcurrentQueue<Runnable>,
 
     /// Local queues created by runners.
-    local_queues: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>,
+    local_queues: RwLock<Vec<Arc<Mutex<VecDeque<Runnable>>>>>,
 
     /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
     notified: AtomicBool,
@@ -724,7 +725,7 @@ struct Runner<'a> {
     ticker: Ticker<'a>,
 
     /// The local queue.
-    local: Arc<ConcurrentQueue<Runnable>>,
+    local: Arc<Mutex<VecDeque<Runnable>>>,
 
     /// Bumped every time a runnable task is found.
     ticks: AtomicUsize,
@@ -736,7 +737,7 @@ impl Runner<'_> {
         let runner = Runner {
             state,
             ticker: Ticker::new(state),
-            local: Arc::new(ConcurrentQueue::bounded(512)),
+            local: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
             ticks: AtomicUsize::new(0),
         };
         state
@@ -753,18 +754,21 @@ impl Runner<'_> {
             .ticker
             .runnable_with(|| {
                 // Try the local queue.
-                if let Ok(r) = self.local.pop() {
-                    return Some(r);
-                }
+                {
+                    let mut local = self.local.lock().unwrap();
+                    if let Some(r) = local.pop_front() {
+                        return Some(r);
+                    }
 
-                // Try stealing from the global queue.
-                if let Ok(r) = self.state.queue.pop() {
-                    steal(&self.state.queue, &self.local);
-                    return Some(r);
+                    // Try stealing from the global queue.
+                    if let Ok(r) = self.state.queue.pop() {
+                        steal(&self.state.queue, &mut local);
+                        return Some(r);
+                    }
                 }
 
                 // Try stealing from other runners.
-                let local_queues = self.state.local_queues.read().unwrap();
+                let local_queues = self.state.local_queues.write().unwrap();
 
                 // Pick a random starting point in the iterator list and rotate the list.
                 let n = local_queues.len();
@@ -776,12 +780,16 @@ impl Runner<'_> {
                     .take(n);
 
                 // Remove this runner's local queue.
-                let iter = iter.filter(|local| !Arc::ptr_eq(local, &self.local));
+                let iter = iter.filter(|src| !Arc::ptr_eq(*src, &self.local));
 
+                let mut dest = self.local.lock().unwrap();
                 // Try stealing from each local queue in the list.
-                for local in iter {
-                    steal(local, &self.local);
-                    if let Ok(r) = self.local.pop() {
+                for src in iter {
+                    {
+                        let mut src = src.lock().unwrap();
+                        steal_local_to_local(&mut src, &mut dest);
+                    }
+                    if let Some(r) = dest.pop_back() {
                         return Some(r);
                     }
                 }
@@ -795,7 +803,8 @@ impl Runner<'_> {
 
         if ticks % 64 == 0 {
             // Steal tasks from the global queue to ensure fair task scheduling.
-            steal(&self.state.queue, &self.local);
+            let mut local = self.local.lock().unwrap();
+            steal(&self.state.queue, &mut local);
         }
 
         runnable
@@ -812,33 +821,74 @@ impl Drop for Runner<'_> {
             .retain(|local| !Arc::ptr_eq(local, &self.local));
 
         // Re-schedule remaining tasks in the local queue.
-        while let Ok(r) = self.local.pop() {
+        let mut local = self.local.lock().unwrap();
+        while let Some(r) = local.pop_front() {
             r.schedule();
         }
     }
 }
 
 /// Steals some items from one queue into another.
-fn steal<T>(src: &ConcurrentQueue<T>, dest: &ConcurrentQueue<T>) {
+fn steal<T>(src: &ConcurrentQueue<T>, dest: &mut VecDeque<T>) {
     // Half of `src`'s length rounded up.
     let mut count = (src.len() + 1) / 2;
 
     if count > 0 {
         // Don't steal more than fits into the queue.
-        if let Some(cap) = dest.capacity() {
-            count = count.min(cap - dest.len());
-        }
+        count = count.min(dest.capacity() - dest.len());
 
         // Steal tasks.
         for _ in 0..count {
             if let Ok(t) = src.pop() {
-                assert!(dest.push(t).is_ok());
+                dest.push_back(t);
             } else {
                 break;
             }
         }
     }
 }
+
+/// Steals some items from one queue into another.
+fn steal_local_to_local<T>(src: &mut VecDeque<T>, dest: &mut VecDeque<T>) {
+    // Half of `src`'s length rounded up.
+    let mut count = (src.len() + 1) / 2;
+
+    if count > 0 {
+        // Don't steal more than fits into the queue.
+        count = count.min(dest.capacity() - dest.len());
+
+        // Steal tasks.
+        for _ in 0..count {
+            if let Some(t) = src.pop_front() {
+                dest.push_back(t);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+// /// Steals some items from one queue into another.
+// fn steal<T>(src: &ConcurrentQueue<T>, dest: &VecDe<T>) {
+//     // Half of `src`'s length rounded up.
+//     let mut count = (src.len() + 1) / 2;
+
+//     if count > 0 {
+//         // Don't steal more than fits into the queue.
+//         if let Some(cap) = dest.capacity() {
+//             count = count.min(cap - dest.len());
+//         }
+
+//         // Steal tasks.
+//         for _ in 0..count {
+//             if let Ok(t) = src.pop() {
+//                 assert!(dest.push(t).is_ok());
+//             } else {
+//                 break;
+//             }
+//         }
+//     }
+// }
 
 /// Debug implementation for `Executor` and `LocalExecutor`.
 fn debug_executor(executor: &Executor<'_>, name: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -873,14 +923,14 @@ fn debug_executor(executor: &Executor<'_>, name: &str, f: &mut fmt::Formatter<'_
     }
 
     /// Debug wrapper for the local runners.
-    struct LocalRunners<'a>(&'a RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>);
+    struct LocalRunners<'a>(&'a RwLock<Vec<Arc<Mutex<VecDeque<Runnable>>>>>);
 
     impl fmt::Debug for LocalRunners<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self.0.try_read() {
                 Ok(lock) => f
                     .debug_list()
-                    .entries(lock.iter().map(|queue| queue.len()))
+                    .entries(lock.iter().map(|queue| queue.lock().unwrap().len()))
                     .finish(),
                 Err(TryLockError::WouldBlock) => f.write_str("<locked>"),
                 Err(TryLockError::Poisoned(_)) => f.write_str("<poisoned>"),
