@@ -31,7 +31,7 @@ use std::task::{Poll, Waker};
 
 use async_lock::OnceCell;
 use async_task::Runnable;
-use concurrent_queue::ConcurrentQueue;
+use crossbeam_deque::{Injector, Steal};
 use futures_lite::{future, prelude::*};
 use slab::Slab;
 use st3::fifo::{Stealer, Worker};
@@ -172,9 +172,8 @@ impl<'a> Executor<'a> {
     /// assert!(ex.try_tick()); // a task was found
     /// ```
     pub fn try_tick(&self) -> bool {
-        match self.state().queue.pop() {
-            Err(_) => false,
-            Ok(runnable) => {
+        match self.state().queue.steal() {
+            Steal::Success(runnable) => {
                 // Notify another ticker now to pick up where this ticker left off, just in case
                 // running the task takes a long time.
                 self.state().notify();
@@ -183,6 +182,7 @@ impl<'a> Executor<'a> {
                 runnable.run();
                 true
             }
+            _ => false,
         }
     }
 
@@ -250,7 +250,7 @@ impl<'a> Executor<'a> {
 
         // TODO(stjepang): If possible, push into the current local queue and notify the ticker.
         move |runnable| {
-            state.queue.push(runnable).unwrap();
+            state.queue.push(runnable);
             state.notify();
         }
     }
@@ -270,7 +270,7 @@ impl Drop for Executor<'_> {
             }
             drop(active);
 
-            while state.queue.pop().is_ok() {}
+            while !state.queue.steal().is_empty() {}
         }
     }
 }
@@ -453,7 +453,7 @@ impl<'a> LocalExecutor<'a> {
         let state = self.inner().state().clone();
 
         move |runnable| {
-            state.queue.push(runnable).unwrap();
+            state.queue.push(runnable);
             state.notify();
         }
     }
@@ -473,7 +473,7 @@ impl<'a> Default for LocalExecutor<'a> {
 /// The state of a executor.
 struct State {
     /// The global queue.
-    queue: ConcurrentQueue<Runnable>,
+    queue: Injector<Runnable>,
 
     /// Local queues created by runners.
     stealers: RwLock<Vec<Stealer<Runnable>>>,
@@ -496,7 +496,7 @@ impl State {
     /// Creates state for a new executor.
     fn new() -> State {
         State {
-            queue: ConcurrentQueue::unbounded(),
+            queue: Injector::new(),
             stealers: RwLock::new(Vec::new()),
             notified: AtomicBool::new(true),
             sleepers: Mutex::new(Sleepers {
@@ -665,7 +665,8 @@ impl Ticker<'_> {
 
     /// Waits for the next runnable task to run.
     async fn runnable(&self) -> Runnable {
-        self.runnable_with(|| self.state.queue.pop().ok()).await
+        self.runnable_with(|| self.state.queue.steal().success())
+            .await
     }
 
     /// Waits for the next runnable task to run, given a function that searches for a task.
@@ -757,7 +758,7 @@ impl Runner<'_> {
                 }
 
                 // Try stealing from the global queue.
-                if let Ok(r) = self.state.queue.pop() {
+                if let Steal::Success(r) = self.state.queue.steal() {
                     State::LOCAL_WORKER.with(|worker| {
                         steal(&self.state.queue, worker);
                     });
@@ -821,7 +822,7 @@ impl Drop for Runner<'_> {
 }
 
 /// Steals some items from one queue into another.
-fn steal<T>(src: &ConcurrentQueue<T>, dest: &Worker<T>) {
+fn steal<T>(src: &Injector<T>, dest: &Worker<T>) {
     // Half of `src`'s length rounded up.
     let mut count = (src.len() + 1) / 2;
 
@@ -831,7 +832,7 @@ fn steal<T>(src: &ConcurrentQueue<T>, dest: &Worker<T>) {
 
         // Steal tasks.
         for _ in 0..count {
-            if let Ok(t) = src.pop() {
+            if let Steal::Success(t) = src.steal() {
                 assert!(dest.push(t).is_ok());
             } else {
                 break;
