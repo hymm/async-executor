@@ -34,6 +34,7 @@ use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::{future, prelude::*};
 use slab::Slab;
+use st3::fifo::{Stealer, Worker};
 
 #[doc(no_inline)]
 pub use async_task::Task;
@@ -475,7 +476,7 @@ struct State {
     queue: ConcurrentQueue<Runnable>,
 
     /// Local queues created by runners.
-    local_queues: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>,
+    stealers: RwLock<Vec<Stealer<Runnable>>>,
 
     /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
     notified: AtomicBool,
@@ -488,11 +489,15 @@ struct State {
 }
 
 impl State {
+    thread_local! {
+        pub static LOCAL_WORKER: Worker<Runnable> = Worker::new(512);
+    }
+
     /// Creates state for a new executor.
     fn new() -> State {
         State {
             queue: ConcurrentQueue::unbounded(),
-            local_queues: RwLock::new(Vec::new()),
+            stealers: RwLock::new(Vec::new()),
             notified: AtomicBool::new(true),
             sleepers: Mutex::new(Sleepers {
                 count: 0,
@@ -723,9 +728,6 @@ struct Runner<'a> {
     /// Inner ticker.
     ticker: Ticker<'a>,
 
-    /// The local queue.
-    local: Arc<ConcurrentQueue<Runnable>>,
-
     /// Bumped every time a runnable task is found.
     ticks: AtomicUsize,
 }
@@ -736,14 +738,11 @@ impl Runner<'_> {
         let runner = Runner {
             state,
             ticker: Ticker::new(state),
-            local: Arc::new(ConcurrentQueue::bounded(512)),
             ticks: AtomicUsize::new(0),
         };
-        state
-            .local_queues
-            .write()
-            .unwrap()
-            .push(runner.local.clone());
+        State::LOCAL_WORKER.with(|worker| {
+            state.stealers.write().unwrap().push(worker.stealer());
+        });
         runner
     }
 
@@ -753,18 +752,20 @@ impl Runner<'_> {
             .ticker
             .runnable_with(|| {
                 // Try the local queue.
-                if let Ok(r) = self.local.pop() {
+                if let Some(r) = State::LOCAL_WORKER.with(|worker| worker.pop()) {
                     return Some(r);
                 }
 
                 // Try stealing from the global queue.
                 if let Ok(r) = self.state.queue.pop() {
-                    steal(&self.state.queue, &self.local);
+                    State::LOCAL_WORKER.with(|worker| {
+                        steal(&self.state.queue, worker);
+                    });
                     return Some(r);
                 }
 
                 // Try stealing from other runners.
-                let local_queues = self.state.local_queues.read().unwrap();
+                let local_queues = self.state.stealers.read().unwrap();
 
                 // Pick a random starting point in the iterator list and rotate the list.
                 let n = local_queues.len();
@@ -775,18 +776,22 @@ impl Runner<'_> {
                     .skip(start)
                     .take(n);
 
-                // Remove this runner's local queue.
-                let iter = iter.filter(|local| !Arc::ptr_eq(local, &self.local));
+                State::LOCAL_WORKER.with(|local_worker| {
+                    // Remove this runner's local queue.
+                    let local_stealer = local_worker.stealer();
+                    let iter = iter.filter(|local| **local == local_stealer);
 
-                // Try stealing from each local queue in the list.
-                for local in iter {
-                    steal(local, &self.local);
-                    if let Ok(r) = self.local.pop() {
-                        return Some(r);
+                    // Try stealing from each local queue in the list.
+                    for local in iter {
+                        if let Ok((r, _)) = State::LOCAL_WORKER
+                            .with(|worker| local.steal_and_pop(worker, |n| n / 2))
+                        {
+                            return Some(r);
+                        }
                     }
-                }
 
-                None
+                    None
+                })
             })
             .await;
 
@@ -795,7 +800,9 @@ impl Runner<'_> {
 
         if ticks % 64 == 0 {
             // Steal tasks from the global queue to ensure fair task scheduling.
-            steal(&self.state.queue, &self.local);
+            State::LOCAL_WORKER.with(|local_worker| {
+                steal(&self.state.queue, local_worker);
+            })
         }
 
         runnable
@@ -804,30 +811,23 @@ impl Runner<'_> {
 
 impl Drop for Runner<'_> {
     fn drop(&mut self) {
-        // Remove the local queue.
-        self.state
-            .local_queues
-            .write()
-            .unwrap()
-            .retain(|local| !Arc::ptr_eq(local, &self.local));
-
-        // Re-schedule remaining tasks in the local queue.
-        while let Ok(r) = self.local.pop() {
-            r.schedule();
-        }
+        State::LOCAL_WORKER.with(|local_worker| {
+            // Re-schedule remaining tasks in the local queue.
+            while let Some(r) = local_worker.pop() {
+                r.schedule();
+            }
+        })
     }
 }
 
 /// Steals some items from one queue into another.
-fn steal<T>(src: &ConcurrentQueue<T>, dest: &ConcurrentQueue<T>) {
+fn steal<T>(src: &ConcurrentQueue<T>, dest: &Worker<T>) {
     // Half of `src`'s length rounded up.
     let mut count = (src.len() + 1) / 2;
 
     if count > 0 {
         // Don't steal more than fits into the queue.
-        if let Some(cap) = dest.capacity() {
-            count = count.min(cap - dest.len());
-        }
+        count = count.min(dest.spare_capacity());
 
         // Steal tasks.
         for _ in 0..count {
@@ -872,21 +872,21 @@ fn debug_executor(executor: &Executor<'_>, name: &str, f: &mut fmt::Formatter<'_
         }
     }
 
-    /// Debug wrapper for the local runners.
-    struct LocalRunners<'a>(&'a RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>);
+    // /// Debug wrapper for the local runners.
+    // struct LocalRunners<'a>(&'a RwLock<Vec<Stealer<Runnable>>>);
 
-    impl fmt::Debug for LocalRunners<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self.0.try_read() {
-                Ok(lock) => f
-                    .debug_list()
-                    .entries(lock.iter().map(|queue| queue.len()))
-                    .finish(),
-                Err(TryLockError::WouldBlock) => f.write_str("<locked>"),
-                Err(TryLockError::Poisoned(_)) => f.write_str("<poisoned>"),
-            }
-        }
-    }
+    // impl fmt::Debug for LocalRunners<'_> {
+    //     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    //         match self.0.try_read() {
+    //             Ok(lock) => f
+    //                 .debug_list()
+    //                 .entries(lock.iter().map(|queue| queue.len()))
+    //                 .finish(),
+    //             Err(TryLockError::WouldBlock) => f.write_str("<locked>"),
+    //             Err(TryLockError::Poisoned(_)) => f.write_str("<poisoned>"),
+    //         }
+    //     }
+    // }
 
     /// Debug wrapper for the sleepers.
     struct SleepCount<'a>(&'a Mutex<Sleepers>);
@@ -904,7 +904,7 @@ fn debug_executor(executor: &Executor<'_>, name: &str, f: &mut fmt::Formatter<'_
     f.debug_struct(name)
         .field("active", &ActiveTasks(&state.active))
         .field("global_tasks", &state.queue.len())
-        .field("local_runners", &LocalRunners(&state.local_queues))
+        // .field("local_runners", &LocalRunners(&state.stealers))
         .field("sleepers", &SleepCount(&state.sleepers))
         .finish()
 }
