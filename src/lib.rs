@@ -519,7 +519,14 @@ impl State {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            (0..count).for_each(|_| self.notify());
+            let mut sleepers = self.sleepers.lock().unwrap();
+            for _ in 0..count {
+                if let Some(w) = sleepers.notify() {
+                    w.wake();
+                } else {
+                    break;
+                }
+            }
         }
     }
 }
@@ -667,9 +674,15 @@ impl Ticker<'_> {
     /// Waits for the next runnable task to run, given a function that searches for a task.
     async fn runnable_with(&self, mut search: impl FnMut() -> Option<Runnable>) -> Runnable {
         future::poll_fn(|cx| {
+            let mut count = 0;
             loop {
                 match search() {
                     None => {
+                        if count < 30 {
+                            count += 1;
+                            continue;
+                        }
+                        count = 0;
                         // Move to sleeping and unnotified state.
                         if !self.sleep(cx.waker()) {
                             // If already sleeping and unnotified, return.
@@ -682,7 +695,7 @@ impl Ticker<'_> {
 
                         // Notify another ticker now to pick up where this ticker left off, just in
                         // case running the task takes a long time.
-                        let notify_count = (self.state.queue.len() / 2).max(1);
+                        let notify_count = (self.state.queue.len()).max(1).min(16);
                         self.state.notify_multiple(notify_count);
 
                         return Poll::Ready(r);
