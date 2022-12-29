@@ -506,15 +506,20 @@ impl State {
     /// Notifies a sleeping ticker.
     #[inline]
     fn notify(&self) {
+        let waker = self.sleepers.lock().unwrap().notify();
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    /// Notify multiple sleeping tickers
+    fn notify_multiple(&self, count: usize) {
         if self
             .notified
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let waker = self.sleepers.lock().unwrap().notify();
-            if let Some(w) = waker {
-                w.wake();
-            }
+            (0..count).for_each(|_| self.notify());
         }
     }
 }
@@ -587,11 +592,7 @@ impl Sleepers {
     ///
     /// If a ticker was notified already or there are no tickers, `None` will be returned.
     fn notify(&mut self) -> Option<Waker> {
-        if self.wakers.len() == self.count {
-            self.wakers.pop().map(|item| item.1)
-        } else {
-            None
-        }
+        self.wakers.pop().map(|item| item.1)
     }
 }
 
@@ -681,7 +682,8 @@ impl Ticker<'_> {
 
                         // Notify another ticker now to pick up where this ticker left off, just in
                         // case running the task takes a long time.
-                        self.state.notify();
+                        let notify_count = (self.state.queue.len() / 2).max(1);
+                        self.state.notify_multiple(notify_count);
 
                         return Poll::Ready(r);
                     }
