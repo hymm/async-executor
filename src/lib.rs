@@ -34,7 +34,7 @@ use async_task::Runnable;
 use crossbeam_deque::{Injector, Steal};
 use futures_lite::{future, prelude::*};
 use slab::Slab;
-use st3::fifo::{Stealer, Worker};
+use st3::lifo::{Stealer, Worker};
 
 #[doc(no_inline)]
 pub use async_task::Task;
