@@ -39,6 +39,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod sleepers;
 use std::fmt;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
@@ -50,6 +51,7 @@ use std::task::{Context, Poll, Waker};
 
 use async_task::{Builder, Runnable};
 use concurrent_queue::ConcurrentQueue;
+use dashmap::DashMap;
 use futures_lite::{future, prelude::*};
 use pin_project_lite::pin_project;
 use slab::Slab;
@@ -671,7 +673,7 @@ struct State {
     notified: AtomicBool,
 
     /// A list of sleeping tickers.
-    sleepers: Mutex<Sleepers>,
+    sleepers: Sleepers,
 
     /// Currently active tasks.
     active: Mutex<Slab<Waker>>,
@@ -755,64 +757,42 @@ impl State {
 
 /// A list of sleeping tickers.
 struct Sleepers {
-    /// Number of sleeping tickers (both notified and unnotified).
-    count: usize,
-
     /// IDs and wakers of sleeping unnotified tickers.
     ///
     /// A sleeping ticker is notified when its waker is missing from this list.
-    wakers: Vec<(usize, Waker)>,
-
-    /// Reclaimed IDs.
-    free_ids: Vec<usize>,
+    wakers: Arc<sharded_slab::Slab<Waker>>,
 }
 
 impl Sleepers {
     /// Inserts a new sleeping ticker.
-    fn insert(&mut self, waker: &Waker) -> usize {
-        let id = match self.free_ids.pop() {
-            Some(id) => id,
-            None => self.count + 1,
-        };
-        self.count += 1;
-        self.wakers.push((id, waker.clone()));
-        id
+    fn insert(&self, waker: &Waker) -> Option<usize> {
+        self.wakers.insert(waker.clone())
     }
 
     /// Re-inserts a sleeping ticker's waker if it was notified.
     ///
     /// Returns `true` if the ticker was notified.
-    fn update(&mut self, id: usize, waker: &Waker) -> bool {
-        for item in &mut self.wakers {
-            if item.0 == id {
-                item.1.clone_from(waker);
-                return false;
-            }
-        }
+    fn update(&self, id: usize, waker: &Waker) -> bool {
+        let Some(entry) = self.wakers.get_owned(id) else {
+            // this isn't right. id's should be stable?
+            self.wakers.insert(waker.clone());
+            return true;
+        };
 
-        self.wakers.push((id, waker.clone()));
-        true
+        entry = waker.clone();
+        false
     }
 
     /// Removes a previously inserted sleeping ticker.
     ///
     /// Returns `true` if the ticker was notified.
     fn remove(&mut self, id: usize) -> bool {
-        self.count -= 1;
-        self.free_ids.push(id);
-
-        for i in (0..self.wakers.len()).rev() {
-            if self.wakers[i].0 == id {
-                self.wakers.remove(i);
-                return false;
-            }
-        }
-        true
+        self.wakers.remove(id)
     }
 
     /// Returns `true` if a sleeping ticker is notified or no tickers are sleeping.
     fn is_notified(&self) -> bool {
-        self.count == 0 || self.count > self.wakers.len()
+        self.wakers.is_empty() || self.count > self.wakers.len()
     }
 
     /// Returns notification waker for a sleeping ticker.
@@ -838,29 +818,32 @@ struct Ticker<'a> {
     /// 1) Woken.
     ///    2a) Sleeping and unnotified.
     ///    2b) Sleeping and notified.
-    sleeping: usize,
+    sleeping: Option<usize>,
 }
 
 impl Ticker<'_> {
     /// Creates a ticker.
     fn new(state: &State) -> Ticker<'_> {
-        Ticker { state, sleeping: 0 }
+        Ticker {
+            state,
+            sleeping: None,
+        }
     }
 
     /// Moves the ticker into sleeping and unnotified state.
     ///
     /// Returns `false` if the ticker was already sleeping and unnotified.
     fn sleep(&mut self, waker: &Waker) -> bool {
-        let mut sleepers = self.state.sleepers.lock().unwrap();
+        let sleepers = &self.state.sleepers;
 
         match self.sleeping {
             // Move to sleeping state.
-            0 => {
+            None => {
                 self.sleeping = sleepers.insert(waker);
             }
 
             // Already sleeping, check if notified.
-            id => {
+            Some(id) => {
                 if !sleepers.update(id, waker) {
                     return false;
                 }

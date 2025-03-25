@@ -24,6 +24,7 @@ concurrent-queue = "2.5.0"
 fastrand = "2.0.0"
 futures-lite = { version = "2.0.0", default-features = false }
 pin-project-lite = "0.2"
+sharded-slab = "0.1.7"
 slab = "0.4.7"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
