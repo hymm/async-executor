@@ -51,7 +51,6 @@ use std::task::{Context, Poll, Waker};
 
 use async_task::{Builder, Runnable};
 use concurrent_queue::ConcurrentQueue;
-use dashmap::DashMap;
 use futures_lite::{future, prelude::*};
 use pin_project_lite::pin_project;
 use slab::Slab;
@@ -672,8 +671,7 @@ struct State {
     /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
     notified: AtomicBool,
 
-    /// A list of sleeping tickers.
-    sleepers: Sleepers,
+    sleepers: sleepers::Sleepers,
 
     /// Currently active tasks.
     active: Mutex<Slab<Waker>>,
@@ -686,11 +684,7 @@ impl State {
             queue: ConcurrentQueue::unbounded(),
             local_queues: RwLock::new(Vec::new()),
             notified: AtomicBool::new(true),
-            sleepers: Mutex::new(Sleepers {
-                count: 0,
-                wakers: Vec::new(),
-                free_ids: Vec::new(),
-            }),
+            sleepers: sleepers::Sleepers::new(),
             active: Mutex::new(Slab::new()),
         }
     }
@@ -703,16 +697,7 @@ impl State {
     /// Notifies a sleeping ticker.
     #[inline]
     fn notify(&self) {
-        if self
-            .notified
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let waker = self.sleepers.lock().unwrap().notify();
-            if let Some(w) = waker {
-                w.wake();
-            }
-        }
+        self.sleepers.notify();
     }
 
     pub(crate) fn try_tick(&self) -> bool {
@@ -752,58 +737,6 @@ impl State {
 
         // Run `future` and `run_forever` concurrently until `future` completes.
         future.or(run_forever).await
-    }
-}
-
-/// A list of sleeping tickers.
-struct Sleepers {
-    /// IDs and wakers of sleeping unnotified tickers.
-    ///
-    /// A sleeping ticker is notified when its waker is missing from this list.
-    wakers: Arc<sharded_slab::Slab<Waker>>,
-}
-
-impl Sleepers {
-    /// Inserts a new sleeping ticker.
-    fn insert(&self, waker: &Waker) -> Option<usize> {
-        self.wakers.insert(waker.clone())
-    }
-
-    /// Re-inserts a sleeping ticker's waker if it was notified.
-    ///
-    /// Returns `true` if the ticker was notified.
-    fn update(&self, id: usize, waker: &Waker) -> bool {
-        let Some(entry) = self.wakers.get_owned(id) else {
-            // this isn't right. id's should be stable?
-            self.wakers.insert(waker.clone());
-            return true;
-        };
-
-        entry = waker.clone();
-        false
-    }
-
-    /// Removes a previously inserted sleeping ticker.
-    ///
-    /// Returns `true` if the ticker was notified.
-    fn remove(&mut self, id: usize) -> bool {
-        self.wakers.remove(id)
-    }
-
-    /// Returns `true` if a sleeping ticker is notified or no tickers are sleeping.
-    fn is_notified(&self) -> bool {
-        self.wakers.is_empty() || self.count > self.wakers.len()
-    }
-
-    /// Returns notification waker for a sleeping ticker.
-    ///
-    /// If a ticker was notified already or there are no tickers, `None` will be returned.
-    fn notify(&mut self) -> Option<Waker> {
-        if self.wakers.len() == self.count {
-            self.wakers.pop().map(|item| item.1)
-        } else {
-            None
-        }
     }
 }
 
@@ -859,15 +792,14 @@ impl Ticker<'_> {
 
     /// Moves the ticker into woken state.
     fn wake(&mut self) {
-        if self.sleeping != 0 {
-            let mut sleepers = self.state.sleepers.lock().unwrap();
-            sleepers.remove(self.sleeping);
+        if let Some(waker_id) = self.sleeping {
+            self.state.sleepers.remove(waker_id);
 
             self.state
                 .notified
-                .store(sleepers.is_notified(), Ordering::Release);
+                .store(self.state.sleepers.is_notified(), Ordering::Release);
         }
-        self.sleeping = 0;
+        self.sleeping = None;
     }
 
     /// Waits for the next runnable task to run.
@@ -907,17 +839,15 @@ impl Ticker<'_> {
 impl Drop for Ticker<'_> {
     fn drop(&mut self) {
         // If this ticker is in sleeping state, it must be removed from the sleepers list.
-        if self.sleeping != 0 {
-            let mut sleepers = self.state.sleepers.lock().unwrap();
-            let notified = sleepers.remove(self.sleeping);
+        if let Some(waker_id) = self.sleeping {
+            let notified = self.state.sleepers.remove(waker_id);
 
             self.state
                 .notified
-                .store(sleepers.is_notified(), Ordering::Release);
+                .store(self.state.sleepers.is_notified(), Ordering::Release);
 
             // If this ticker was notified, then notify another ticker.
             if notified {
-                drop(sleepers);
                 self.state.notify();
             }
         }
@@ -1107,24 +1037,11 @@ fn debug_state(state: &State, name: &str, f: &mut fmt::Formatter<'_>) -> fmt::Re
         }
     }
 
-    /// Debug wrapper for the sleepers.
-    struct SleepCount<'a>(&'a Mutex<Sleepers>);
-
-    impl fmt::Debug for SleepCount<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self.0.try_lock() {
-                Ok(lock) => fmt::Debug::fmt(&lock.count, f),
-                Err(TryLockError::WouldBlock) => f.write_str("<locked>"),
-                Err(TryLockError::Poisoned(_)) => f.write_str("<poisoned>"),
-            }
-        }
-    }
-
     f.debug_struct(name)
         .field("active", &ActiveTasks(&state.active))
         .field("global_tasks", &state.queue.len())
         .field("local_runners", &LocalRunners(&state.local_queues))
-        .field("sleepers", &SleepCount(&state.sleepers))
+        // .field("sleepers", &SleepCount(&state.sleepers))
         .finish()
 }
 
